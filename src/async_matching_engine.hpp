@@ -4,18 +4,19 @@
 #include <boost/lockfree/spsc_queue.hpp>
 #include <atomic>
 #include <thread>
-#include <memory>
 #include <utility>
 
 namespace matching{
 
-//simple single producer / single consumer async wrapper
+//single producer / single consumer async wrapper
+//uses value-based SPSC queue (no heap allocation per event)
 class AsyncMatchingEngine{
 public:
     using TradeCallback = MatchingEngine::TradeCallback;
 
     explicit AsyncMatchingEngine(TradeCallback cb, std::size_t queue_capacity = 1 << 20)
-    : engine_(std::move(cb)), queue_(queue_capacity), running_(true), worker_(&AsyncMatchingEngine::runLoop, this){}
+    : engine_(std::move(cb)), queue_(queue_capacity), running_(true),
+      worker_(&AsyncMatchingEngine::runLoop, this){}
 
     ~AsyncMatchingEngine(){stop();}
 
@@ -23,12 +24,25 @@ public:
     AsyncMatchingEngine(const AsyncMatchingEngine&) = delete;
     AsyncMatchingEngine& operator=(const AsyncMatchingEngine&) = delete;
 
-    //submit an event from the producer thread
-    //will spin until the queue has space (simple backoff)
+    //submit an external Event (resolves string symbol → SymbolId, then pushes value)
     void submit(const Event& e){
-        Event* copy = new Event(e);
-        while(!queue_.push(copy)){
-            //in real sys, add better backoff
+        InternalEvent ie{};
+        ie.symbol = engine_.resolveSymbol(e.symbol);
+        ie.type = e.type;
+        ie.side = e.side;
+        ie.price = e.price;
+        ie.qty = e.qty;
+        ie.id = e.id;
+        ie.tif = e.tif;
+        ie.user_id = e.user_id;
+        while(!queue_.push(ie)){
+            std::this_thread::yield();
+        }
+    }
+
+    //submit a pre-resolved InternalEvent directly (hot path, zero allocation)
+    void submit(const InternalEvent& ie){
+        while(!queue_.push(ie)){
             std::this_thread::yield();
         }
     }
@@ -37,9 +51,10 @@ public:
     void stop(){
         bool expected = true;
         if(running_.compare_exchange_strong(expected, false)){
-            //wake up worker if its sleeping on an empty queue
-            //by pushing a null ptr sentinel
-            while(!queue_.push(nullptr)){std::this_thread::yield();}
+            //push stop sentinel
+            InternalEvent sentinel{};
+            sentinel.type = EventType::Stop;
+            while(!queue_.push(sentinel)){std::this_thread::yield();}
             if(worker_.joinable()){worker_.join();}
         }
     }
@@ -49,25 +64,21 @@ public:
 
 private:
     MatchingEngine engine_;
-    boost::lockfree::spsc_queue<Event*> queue_;
+    boost::lockfree::spsc_queue<InternalEvent> queue_;
     std::atomic<bool> running_;
     std::thread worker_;
 
     void runLoop(){
-        Event* ep = nullptr;
+        InternalEvent ie{};
         while(true){
-            while(queue_.pop(ep)){
-                if(ep == nullptr){
-                    //sentinel -> terminate
-                    return;
-                }
-                engine_.process(*ep);
-                delete ep;
+            while(queue_.pop(ie)){
+                if(ie.type == EventType::Stop){return;}
+                engine_.processInternal(ie);
             }
-            //if we're asked to stop and queue is empty, exit
-            if(!running_.load(std::memory_order_relaxed) && queue_.empty()){break;}
+            //queue empty: check if we should exit
+            if(!running_.load(std::memory_order_relaxed)){break;}
+            std::this_thread::yield();
         }
-        std::this_thread::yield();
     }
 };
 }

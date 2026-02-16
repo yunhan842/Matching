@@ -18,5 +18,12 @@ target_include_directories(orderbook PRIVATE
 )
 
 target_compile_options(orderbook PRIVATE
-    $<$<CONFIG:Release>:-O3 -march=native>
+    $<$<CONFIG:Release>:-O3 -march=native -funroll-loops>
 )
+
+# Link-Time Optimization (Release)
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+if(ipo_supported)
+    set_property(TARGET orderbook PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()

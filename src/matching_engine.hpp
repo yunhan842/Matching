@@ -1,32 +1,74 @@
 #pragma once
 
 #include "orderbook.hpp"
-#include <unordered_map>
+#include <deque>
 #include <string>
 #include <optional>
 #include <utility>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
+#include <memory>
+#include <vector>
+#include <boost/unordered/unordered_flat_map.hpp>
 
-#define MATCHING_ENABLE_USER_TRACKING 1
+#define MATCHING_ENABLE_USER_TRACKING 0
 
 namespace matching{
 
-enum class EventType{NewLimit, NewMarket, Cancel, Replace};
+enum class EventType: std::uint8_t {NewLimit, NewMarket, Cancel, Replace, Stop};
 
+//external event: string symbol (for protocol / parsing layer)
 struct Event{
     EventType type;
     std::string symbol;
 
-    //for newlimit/newmarket
     Side side{Side::Buy};
     Price price{0};
     Qty qty{0};
 
-    //for cancel
     OrderId id{0};
     TimeInForce tif{TimeInForce::GFD};
     UserId user_id{1};
+};
+
+//internal event: SymbolId (hot path, zero allocation, trivially copyable)
+struct InternalEvent{
+    SymbolId symbol;
+    OrderId id;
+    Price price;
+    Qty qty;
+    UserId user_id;
+    EventType type;
+    Side side;
+    TimeInForce tif;
+};
+
+//maps string symbol names ↔ integer IDs
+class SymbolIndex{
+public:
+    SymbolId getOrCreate(const std::string& name){
+        auto it = to_id_.find(name);
+        if(it != to_id_.end()){return it->second;}
+        SymbolId id = static_cast<SymbolId>(names_.size());
+        names_.push_back(name);
+        to_id_[name] = id;
+        return id;
+    }
+
+    std::optional<SymbolId> find(const std::string& name) const{
+        auto it = to_id_.find(name);
+        if(it != to_id_.end()){return it->second;}
+        return std::nullopt;
+    }
+
+    const std::string& name(SymbolId id) const{return names_[id];}
+    const char* nameCStr(SymbolId id) const{return names_[id].c_str();}
+    std::size_t size() const{return names_.size();}
+
+private:
+    boost::unordered_flat_map<std::string, SymbolId> to_id_;
+    std::deque<std::string> names_; //deque: stable pointers on push_back
 };
 
 struct TopOfBook{
@@ -39,27 +81,40 @@ struct TopOfBook{
 
 class MatchingEngine{
 public:
-    using TradeCallback = OrderBook::TradeCallBack;
+    using TradeCallback = std::function<void(const Trade&)>;
 
-    explicit MatchingEngine(TradeCallback cb = nullptr): 
+    //internal callback: concrete type, devirtualized + inlinable
+    struct InternalCallback{
+        MatchingEngine* engine;
+        void operator()(const Trade& t) const{engine->handleTrade(t);}
+    };
+    using BookType = OrderBook<InternalCallback>;
+
+    explicit MatchingEngine(TradeCallback cb = nullptr):
         callback_(std::move(cb)){}
-    
+
+    //non-copyable, non-movable (InternalCallback stores `this`)
+    MatchingEngine(const MatchingEngine&) = delete;
+    MatchingEngine& operator=(const MatchingEngine&) = delete;
+    MatchingEngine(MatchingEngine&&) = delete;
+    MatchingEngine& operator=(MatchingEngine&&) = delete;
+
     struct UserSymbolPosition{
-        Qty position{0}; //+long,-short
-        Qty traded_volume{0}; //sum of qty traded
+        Qty position{0};
+        Qty traded_volume{0};
     };
 
-    #ifdef MATCHING_ENABLE_USER_TRACKING
-    //helper to inspect user positions
+    #if MATCHING_ENABLE_USER_TRACKING
     std::optional<UserSymbolPosition> userPositions(UserId user, const std::string& symbol) const{
         auto itUser = user_positions_.find(user);
         if(itUser == user_positions_.end()){return std::nullopt;}
-        auto itSymbol = itUser->second.find(symbol);
-        if(itSymbol == itUser->second.end()){return std::nullopt;}
-        return itSymbol->second;
+        auto sid = symbols_.find(symbol);
+        if(!sid){return std::nullopt;}
+        auto itSym = itUser->second.find(*sid);
+        if(itSym == itUser->second.end()){return std::nullopt;}
+        return itSym->second;
     }
     #else
-    //tracking disabled: always "no position"
     std::optional<UserSymbolPosition> userPositions(UserId, const std::string&) const{
         return std::nullopt;
     }
@@ -67,14 +122,32 @@ public:
 
     void setMaxPosition(Qty limit){max_abs_position_ = limit;}
 
-    #ifdef MATCHING_ENABLE_USER_TRACKING
+    #if MATCHING_ENABLE_USER_TRACKING
     void reserveOwnerMap(std::size_t n){owner_.reserve(n);}
     #else
-    void reserveOwnerMap(std::size_t){/*no-op when tracking is disabled*/}
+    void reserveOwnerMap(std::size_t){}
     #endif
-    
-    //core event processing api
+
+    //resolve string symbol → SymbolId
+    SymbolId resolveSymbol(const std::string& name){return symbols_.getOrCreate(name);}
+    const std::string& symbolName(SymbolId id) const{return symbols_.name(id);}
+
+    //process external Event (string symbol → resolved internally)
     void process(const Event& e){
+        InternalEvent ie{};
+        ie.symbol = symbols_.getOrCreate(e.symbol);
+        ie.type = e.type;
+        ie.side = e.side;
+        ie.price = e.price;
+        ie.qty = e.qty;
+        ie.id = e.id;
+        ie.tif = e.tif;
+        ie.user_id = e.user_id;
+        processInternal(ie);
+    }
+
+    //process internal event (hot path, no string allocation)
+    void processInternal(const InternalEvent& e){
         switch(e.type){
         case EventType::NewLimit:
             newLimit(e.symbol, e.user_id, e.side, e.price, e.qty, e.tif);
@@ -86,42 +159,47 @@ public:
             cancel(e.symbol, e.id);
             break;
         case EventType::Replace:
-        #ifdef MATCHING_ENABLE_USER_TRACKING
-            //keep same user as old order if known
-            UserId user = 1;
-            if(auto it = owner_.find(e.id); it != owner_.end()){user = it->second;}
+            #if MATCHING_ENABLE_USER_TRACKING
             {
+                UserId user = e.user_id;
+                if(auto it = owner_.find(e.id); it != owner_.end()){user = it->second;}
                 OrderId newId = replace(e.symbol, e.id, e.side, e.price, e.qty, e.tif);
                 if(newId != 0){owner_[newId] = user;}
                 owner_.erase(e.id);
             }
-        #else
-            //tracking disabled: simple cancel+new using default user semantics
+            #else
             replace(e.symbol, e.id, e.side, e.price, e.qty, e.tif);
-        #endif
+            #endif
+            break;
+        case EventType::Stop:
             break;
         }
     }
-    
-    //old 4 arg signature -> also uses default user + default tif
+
+    //--- convenience overloads (string symbols) ---
+
     OrderId newLimit(const std::string& symbol, Side side, Price price, Qty qty){
-        return newLimit(symbol, /*user*/ 1, side, price, qty, TimeInForce::GFD);
+        return newLimit(symbols_.getOrCreate(symbol), UserId{1}, side, price, qty, TimeInForce::GFD);
     }
 
-    //convenience overload: no explicit user -> use default user 1, but still risk + owner aware
     OrderId newLimit(const std::string& symbol, Side side, Price price, Qty qty, TimeInForce tif){
-        return newLimit(symbol, /*user*/ 1, side, price, qty, tif);
+        return newLimit(symbols_.getOrCreate(symbol), UserId{1}, side, price, qty, tif);
     }
 
-    //core implementation: always user-aware, always risk-aware
     OrderId newLimit(const std::string& symbol, UserId user, Side side, Price price, Qty qty, TimeInForce tif = TimeInForce::GFD){
-        #ifdef MATCHING_ENABLE_USER_TRACKING
-        if(!checkRisk(user, symbol, side, qty)){return 0;} //risk reject: in a real system, might send an explicit reject message
+        return newLimit(symbols_.getOrCreate(symbol), user, side, price, qty, tif);
+    }
+
+    //--- core SymbolId-based methods ---
+
+    OrderId newLimit(SymbolId symbol, UserId user, Side side, Price price, Qty qty, TimeInForce tif = TimeInForce::GFD){
+        #if MATCHING_ENABLE_USER_TRACKING
+        if(!checkRisk(user, symbol, side, qty)){return 0;}
         #endif
 
         auto& book = getOrCreateBook(symbol);
 
-        #ifdef MATCHING_ENABLE_USER_TRACKING
+        #if MATCHING_ENABLE_USER_TRACKING
         current_user_ = user;
         current_side_ = side;
         have_current_ = true;
@@ -129,7 +207,7 @@ public:
 
         OrderId id = book.addLimit(side, price, qty, tif);
 
-        #ifdef MATCHING_ENABLE_USER_TRACKING
+        #if MATCHING_ENABLE_USER_TRACKING
         have_current_ = false;
         if(id != 0){owner_[id] = user;}
         #endif
@@ -137,20 +215,22 @@ public:
         return id;
     }
 
-    //market order (price ignored, just crosses the book)
     OrderId newMarket(const std::string& symbol, Side side, Qty qty){
-        return newMarket(symbol, /*user*/ 1, side, qty);
+        return newMarket(symbols_.getOrCreate(symbol), UserId{1}, side, qty);
     }
 
-    //core implementatiob
     OrderId newMarket(const std::string& symbol, UserId user, Side side, Qty qty){
-        #ifdef MATCHING_ENABLE_USER_TRACKING
+        return newMarket(symbols_.getOrCreate(symbol), user, side, qty);
+    }
+
+    OrderId newMarket(SymbolId symbol, UserId user, Side side, Qty qty){
+        #if MATCHING_ENABLE_USER_TRACKING
         if(!checkRisk(user, symbol, side, qty)){return 0;}
         #endif
 
         auto& book = getOrCreateBook(symbol);
 
-        #ifdef MATCHING_ENABLE_USER_TRACKING
+        #if MATCHING_ENABLE_USER_TRACKING
         current_user_ = user;
         current_side_ = side;
         have_current_ = true;
@@ -158,34 +238,44 @@ public:
 
         OrderId id = book.addMarket(side, qty);
 
-        #ifdef MATCHING_ENABLE_USER_TRACKING
+        #if MATCHING_ENABLE_USER_TRACKING
         have_current_ = false;
         if(id != 0){owner_[id] = user;}
         #endif
 
-        return id; 
+        return id;
     }
 
-    //cancel by symbol + order id
     bool cancel(const std::string& symbol, OrderId id){
-        auto it = books_.find(symbol);
-        if(it == books_.end()){return false;}
-        return it->second.cancel(id);
+        auto sid = symbols_.find(symbol);
+        if(!sid){return false;}
+        return cancel(*sid, id);
     }
 
-    //cancel/replace: cancel old_id in symbol, then submit new limit order
-    //this loses original time priority (simple model)
+    bool cancel(SymbolId symbol, OrderId id){
+        if(symbol >= books_.size() || !books_[symbol]){return false;}
+        return books_[symbol]->cancel(id);
+    }
+
     OrderId replace(const std::string& symbol, OrderId old_id, Side side, Price price, Qty qty, TimeInForce tif = TimeInForce::GFD){
-        cancel(symbol, old_id);
-        return newLimit(symbol, side, price, qty, tif);
+        return replace(symbols_.getOrCreate(symbol), old_id, side, price, qty, tif);
     }
 
-    //get top of book for a symbol
+    OrderId replace(SymbolId symbol, OrderId old_id, Side side, Price price, Qty qty, TimeInForce tif = TimeInForce::GFD){
+        cancel(symbol, old_id);
+        return newLimit(symbol, UserId{1}, side, price, qty, tif);
+    }
+
     TopOfBook topOfBook(const std::string& symbol) const{
+        auto sid = symbols_.find(symbol);
+        if(!sid){return TopOfBook{};}
+        return topOfBook(*sid);
+    }
+
+    TopOfBook topOfBook(SymbolId symbol) const{
         TopOfBook tob{};
-        auto it = books_.find(symbol);
-        if(it == books_.end()){return tob;}
-        const OrderBook& book = it->second;
+        if(symbol >= books_.size() || !books_[symbol]){return tob;}
+        const auto& book = *books_[symbol];
         tob.best_bid = book.bestBid();
         tob.bid_size = book.bestBidSize();
         tob.best_ask = book.bestAsk();
@@ -194,29 +284,37 @@ public:
         return tob;
     }
 
-    const OrderBook* findBook(const std::string& symbol) const{
-        auto it = books_.find(symbol);
-        if(it == books_.end()){return nullptr;}
-        return &it->second;
+    const BookType* findBook(const std::string& symbol) const{
+        auto sid = symbols_.find(symbol);
+        if(!sid || *sid >= books_.size() || !books_[*sid]){return nullptr;}
+        return books_[*sid].get();
     }
 
     std::optional<BookStats> bookStats(const std::string& symbol) const{
-        auto it = books_.find(symbol);
-        if(it == books_.end()){return std::nullopt;}
-        return it->second.stats();
+        auto sid = symbols_.find(symbol);
+        if(!sid || *sid >= books_.size() || !books_[*sid]){return std::nullopt;}
+        return books_[*sid]->stats();
     }
 
-private:
-    //boost library's flap map over stl unordered map for performance
-    TradeCallback callback_;
-    using BookMap = boost::unordered_flat_map<std::string, OrderBook>;
-    BookMap books_;
+    std::optional<BookStats> bookStats(SymbolId symbol) const{
+        if(symbol >= books_.size() || !books_[symbol]){return std::nullopt;}
+        return books_[symbol]->stats();
+    }
 
-    #ifdef MATCHING_ENABLE_USER_TRACKING
+    SymbolIndex& symbolIndex(){return symbols_;}
+    const SymbolIndex& symbolIndex() const{return symbols_;}
+
+private:
+    TradeCallback callback_;
+    SymbolIndex symbols_;
+    //O(1) book lookup by SymbolId (index into vector)
+    std::vector<std::unique_ptr<BookType>> books_;
+
+    #if MATCHING_ENABLE_USER_TRACKING
     using OwnerMap = boost::unordered_flat_map<OrderId, UserId>;
     OwnerMap owner_;
 
-    using UserPositionsMap = boost::unordered_flat_map<UserId, boost::unordered_flat_map<std::string, UserSymbolPosition>>;
+    using UserPositionsMap = boost::unordered_flat_map<UserId, boost::unordered_flat_map<SymbolId, UserSymbolPosition>>;
     UserPositionsMap user_positions_;
 
     UserId current_user_{0};
@@ -224,73 +322,64 @@ private:
     bool have_current_{false};
     #endif
 
-    Qty max_abs_position_ = static_cast<Qty>(1'000'000'000); //big default (can be changed)
+    Qty max_abs_position_ = static_cast<Qty>(1'000'000'000);
 
-    OrderBook& getOrCreateBook(const std::string& symbol){
-        auto it = books_.find(symbol);
-        if(it == books_.end()){
-            auto res = books_.emplace(symbol, OrderBook(symbol, [this](const Trade& t){
-                handleTrade(t);
-            }));
-            return res.first->second;
+    BookType& getOrCreateBook(SymbolId symbol){
+        if(symbol >= books_.size()){
+            books_.resize(symbol + 1);
         }
-        return it->second;
+        if(!books_[symbol]){
+            books_[symbol] = std::make_unique<BookType>(
+                symbol, symbols_.nameCStr(symbol), InternalCallback{this});
+        }
+        return *books_[symbol];
     }
 
     void handleTrade(const Trade& t){
-        #ifdef MATCHING_ENABLE_USER_TRACKING
-        //update user positions if we know order owners
+        #if MATCHING_ENABLE_USER_TRACKING
         auto itB = owner_.find(t.buy_id);
         auto itS = owner_.find(t.sell_id);
 
-        //buy side
         if(itB != owner_.end()){
-            UserId u = itB->second;
-            auto& pos = user_positions_[u][t.symbol];
-            pos.position += t.qty; //bought qty
+            auto& pos = user_positions_[itB->second][t.symbol_id];
+            pos.position += t.qty;
             pos.traded_volume += t.qty;
         }
         else if(have_current_ && current_side_ == Side::Buy && t.buy_id != 0){
-            //incoming buy order whose owner_ hasn't been recorded yet
-            auto& pos = user_positions_[current_user_][t.symbol];
+            auto& pos = user_positions_[current_user_][t.symbol_id];
             pos.position += t.qty;
             pos.traded_volume += t.qty;
         }
 
-        //sell side
         if(itS != owner_.end()){
-            UserId u = itS->second;
-            auto& pos = user_positions_[u][t.symbol];
-            pos.position -= t.qty; //sold qty
+            auto& pos = user_positions_[itS->second][t.symbol_id];
+            pos.position -= t.qty;
             pos.traded_volume += t.qty;
         }
         else if(have_current_ && current_side_ == Side::Sell && t.sell_id != 0){
-            //incoming sell order whose owner_ hasn't been recorded yet
-            auto& pos = user_positions_[current_user_][t.symbol];
+            auto& pos = user_positions_[current_user_][t.symbol_id];
             pos.position -= t.qty;
             pos.traded_volume += t.qty;
         }
         #endif
 
-        //forward to user callback
         if(callback_){callback_(t);}
     }
 
-    #ifdef MATCHING_ENABLE_USER_TRACKING
-    bool checkRisk(UserId user, const std::string& symbol, Side side, Qty qty) const{
+    #if MATCHING_ENABLE_USER_TRACKING
+    bool checkRisk(UserId user, SymbolId symbol, Side side, Qty qty) const{
         auto itUser = user_positions_.find(user);
         Qty curr = 0;
         if(itUser != user_positions_.end()){
-            auto itSymbol = itUser->second.find(symbol);
-            if(itSymbol != itUser->second.end()){curr = itSymbol->second.position;}
+            auto itSym = itUser->second.find(symbol);
+            if(itSym != itUser->second.end()){curr = itSym->second.position;}
         }
         Qty newPos = curr + (side == Side::Buy ? qty: -qty);
         if(std::llabs(newPos) > max_abs_position_){return false;}
         return true;
     }
     #else
-    //tracking disabled: always pass risk
-    bool checkRisk(UserId, const std::string&, Side, Qty) const{return true;}
+    bool checkRisk(UserId, SymbolId, Side, Qty) const{return true;}
     #endif
 };
 }
