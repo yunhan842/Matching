@@ -6,6 +6,7 @@ A small, high-performance C++ matching engine that maintains a limit order book,
 - Interactive “exchange shell” mode
 - Logging + replay of events
 - Sync and async matching engines
+- Simple simulated market-making strategy layer
 - Optional per-user position tracking and basic risk checks
 
 This is meant as an educational / toy exchange core, not production infrastructure.
@@ -35,6 +36,15 @@ This is meant as an educational / toy exchange core, not production infrastructu
 - `OrderBook` – matching logic for a single symbol
 - `MatchingEngine` – manages multiple books, routes events, tracks stats
 - `AsyncMatchingEngine` – single-producer / single-consumer wrapper using a lock-free SPSC queue
+- `SimpleMarketMaker` – strategy-layer framework for quoting, inventory, cash, and mark-to-market PnL
+
+**Market-making demo**
+
+- Posts bid/ask quotes around an estimated fair value
+- Skews quotes based on inventory
+- Cancels/replaces stale quotes
+- Tracks fills, position, cash, and mark-to-market PnL
+- Run with `./build/bin/orderbook --mm-demo`
 
 **I/O & tooling**
 

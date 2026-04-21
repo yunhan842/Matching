@@ -1,5 +1,6 @@
 #include "matching_engine.hpp"
 #include "async_matching_engine.hpp"
+#include "market_maker.hpp"
 #include "protocol.hpp"
 #include <iostream>
 #include <random>
@@ -389,8 +390,74 @@ void runReplay(const std::string& filename){
     }
 }
 
+void runMarketMakerDemo(){
+    using namespace matching;
+
+    MarketMakerConfig config{};
+    config.symbol = "MM";
+    config.user_id = UserId{9001};
+    config.quote_qty = 25;
+    config.fair_value = 100;
+    config.half_spread_ticks = 1;
+    config.max_inventory = 150;
+    config.inventory_skew_step = 50;
+
+    SimpleMarketMaker* maker_ptr = nullptr;
+    MatchingEngine engine([&](const Trade& t){
+        if(maker_ptr && maker_ptr->onTrade(t)){
+            std::cout << "MM_FILL symbol=" << t.symbol_name
+                      << " px=" << t.price
+                      << " qty=" << t.qty
+                      << " buy=" << t.buy_id
+                      << " sell=" << t.sell_id << "\n";
+        }
+    });
+
+    SimpleMarketMaker maker(config);
+    maker_ptr = &maker;
+
+    // Seed an external market around fair value so the maker can quote inside it.
+    engine.newLimit(config.symbol, UserId{1001}, Side::Buy,  config.fair_value - 2, 500);
+    engine.newLimit(config.symbol, UserId{1002}, Side::Sell, config.fair_value + 2, 500);
+
+    std::mt19937_64 rng(42);
+    std::uniform_int_distribution<int> side_dist(0, 1);
+    std::uniform_int_distribution<int> qty_dist(5, 20);
+
+    std::cout << "\n--- Market maker demo ---\n";
+    for(int tick = 1; tick <= 40; ++tick){
+        maker.onTick(engine);
+
+        Side aggressor_side = side_dist(rng) == 0 ? Side::Buy : Side::Sell;
+        Qty qty = qty_dist(rng);
+        engine.newMarket(config.symbol, UserId{2000 + tick}, aggressor_side, qty);
+
+        maker.onTick(engine);
+        if(tick % 5 == 0){
+            std::cout << "tick=" << tick << " ";
+            maker.printStatus(engine, std::cout);
+        }
+    }
+
+    maker.cancelAll(engine);
+
+    auto tob = engine.topOfBook(config.symbol);
+    std::cout << "Final " << config.symbol
+              << " bid=" << (tob.best_bid ? std::to_string(*tob.best_bid) : "none")
+              << " x " << (tob.bid_size ? std::to_string(*tob.bid_size) : "0")
+              << " ask=" << (tob.best_ask ? std::to_string(*tob.best_ask) : "none")
+              << " x " << (tob.ask_size ? std::to_string(*tob.ask_size) : "0")
+              << "\n";
+    maker.printStatus(engine, std::cout);
+}
+
 int main(int argc, char** argv){
     using namespace matching;
+
+    if(argc >= 2 && std::string(argv[1]) == "--mm-demo"){
+        runMarketMakerDemo();
+        return 0;
+    }
 
     if(argc >= 3 && std::string(argv[1]) == "--replay"){
         runReplay(argv[2]);
